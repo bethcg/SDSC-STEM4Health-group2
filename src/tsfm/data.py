@@ -56,18 +56,81 @@ class ChannelStats:
         return (x - self.mean[:, None]) / self.std[:, None]
 
 
+class Augmenter:
+    """Label-preserving augmentations for standardised [C, T] batch series.
+
+    Every strength is calibrated per variable from the *training* batches, because
+    the variables behave very differently (process A EDA):
+      * high-frequency noise ranges from ~0.01 sd (temperature_2) to ~0.9 sd (pressure_2/4)
+      * batch-to-batch level differences of accepted batches are tiny for some variables
+        (flow_rate_1, temperature_3/4: ~0.01 sd) while rejected batches show clear offsets
+        there, so level shifts must stay far below that spread or they fake a "rejected" look.
+
+    Each transform is applied independently with probability `p`:
+      1. jitter        add N(0, (jitter * noise_c)^2) per time step
+      2. level shift   add N(0, (shift * between_c)^2) once per channel
+      3. amplitude     scale fluctuations around the channel mean by N(1, scale^2)
+      4. time stretch  resample to length * U(1 - stretch, 1 + stretch)
+      5. crop          keep a random contiguous window of >= crop_min of the series
+
+    Deliberately NOT used: time reversal or flips (the process is directional: start-up
+    ramp, shut-down), mixup across labels, channel permutation (variable identity is
+    embedded), and dropping whole channels (could delete the only evidence of a fault).
+    """
+
+    def __init__(self, noise: np.ndarray, between: np.ndarray, p: float = 0.5, jitter: float = 0.25,
+                 shift: float = 0.25, scale: float = 0.05, stretch: float = 0.1, crop_min: float = 0.9):
+        self.noise, self.between = noise.astype(np.float32), between.astype(np.float32)
+        self.p, self.jitter, self.shift, self.scale = p, jitter, shift, scale
+        self.stretch, self.crop_min = stretch, crop_min
+
+    @classmethod
+    def fit(cls, series: list[np.ndarray], labels: list[int], **kw) -> "Augmenter":
+        """series: standardised [C, T] arrays of the training split."""
+        noise = np.median([np.diff(s, axis=1).std(axis=1) / np.sqrt(2) for s in series], axis=0)
+        ref = [s for s, y in zip(series, labels) if y == 0] or series   # accepted batches if labelled
+        med = np.stack([np.median(s, axis=1) for s in ref])
+        between = 1.4826 * np.median(np.abs(med - np.median(med, axis=0)), axis=0)   # robust sd
+        return cls(noise, between, **kw)
+
+    def __call__(self, x: np.ndarray) -> np.ndarray:
+        rng = np.random
+        C, T = x.shape
+        x = x.copy()
+        if rng.rand() < self.p:
+            x += rng.randn(C, T).astype(np.float32) * (self.jitter * self.noise)[:, None]
+        if rng.rand() < self.p:
+            x += (rng.randn(C) * self.shift * self.between).astype(np.float32)[:, None]
+        if rng.rand() < self.p:
+            mu = x.mean(axis=1, keepdims=True)
+            x = mu + (x - mu) * (1 + self.scale * rng.randn(C, 1)).astype(np.float32)
+        if rng.rand() < self.p:
+            new_T = max(8, int(round(T * rng.uniform(1 - self.stretch, 1 + self.stretch))))
+            src, dst = np.linspace(0, 1, T), np.linspace(0, 1, new_T)
+            x = np.stack([np.interp(dst, src, row) for row in x]).astype(np.float32)
+            T = new_T
+        if rng.rand() < self.p:
+            keep = int(T * rng.uniform(self.crop_min, 1.0))
+            start = rng.randint(0, T - keep + 1)
+            x = x[:, start:start + keep]
+        return np.ascontiguousarray(x)
+
+
 class BatchSeriesDataset(Dataset):
     def __init__(self, ids, series, labels, stats: ChannelStats, max_len: int | None = None,
-                 random_crop: bool = False):
+                 random_crop: bool = False, augment: Augmenter | None = None):
         self.ids, self.labels = ids, labels
         self.series = [stats.apply(s).astype(np.float32) for s in series]
         self.max_len, self.random_crop = max_len, random_crop
+        self.augment = augment
 
     def __len__(self):
         return len(self.series)
 
     def __getitem__(self, i):
         x = self.series[i]
+        if self.augment is not None:
+            x = self.augment(x)
         if self.max_len is not None and x.shape[1] > self.max_len:
             start = np.random.randint(0, x.shape[1] - self.max_len + 1) if self.random_crop else 0
             x = x[:, start:start + self.max_len]
@@ -106,7 +169,9 @@ class BatchSeriesDataModule(L.LightningDataModule):
 
     def __init__(self, train_csv: str, test_csv: str | None = None, patch_size: int = 32,
                  batch_size: int = 8, val_fraction: float = 0.2, max_len: int | None = 4096,
-                 seed: int = 42, num_workers: int = 0):
+                 seed: int = 42, num_workers: int = 0, augment: dict | None = None):
+        """augment: None = off, or a dict of Augmenter strengths ({} = defaults).
+        Augmentation is applied to the training split only."""
         super().__init__()
         self.save_hyperparameters()
 
@@ -120,8 +185,12 @@ class BatchSeriesDataModule(L.LightningDataModule):
         tr, va = train_test_split(idx, test_size=h.val_fraction, random_state=h.seed, stratify=strat)
         pick = lambda lst, ix: [lst[i] for i in ix]
         self.stats = ChannelStats.fit(pick(series, tr))
+        self.augmenter = None
+        if h.augment is not None:
+            std_train = [self.stats.apply(s) for s in pick(series, tr)]
+            self.augmenter = Augmenter.fit(std_train, pick(labels, tr), **h.augment)
         self.train_ds = BatchSeriesDataset(pick(ids, tr), pick(series, tr), pick(labels, tr),
-                                           self.stats, h.max_len, random_crop=True)
+                                           self.stats, h.max_len, random_crop=True, augment=self.augmenter)
         self.val_ds = BatchSeriesDataset(pick(ids, va), pick(series, va), pick(labels, va), self.stats)
         if h.test_csv:
             t_ids, t_series, t_labels, t_channels = load_batches(h.test_csv)

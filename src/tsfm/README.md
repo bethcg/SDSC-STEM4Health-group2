@@ -40,6 +40,19 @@ python src/tsfm/train.py evaluate --checkpoint lightning_logs/finetune/version_0
 python src/tsfm/train.py reconstruct --checkpoint lightning_logs/pretrain/version_0/checkpoints/best.ckpt
 ```
 Test metrics use "rejected" as the positive class for precision, recall and F1.
+
+### Exporting a model
+```bash
+python src/tsfm/train.py export --checkpoint lightning_logs/finetune/version_0/checkpoints/best.ckpt   # -> model_process_A.pt
+```
+This writes one standalone file (`--out` changes the name). It holds the encoder and head weights, the architecture, the variable order, and the training normalisation means and standard deviations.
+Loading it needs only PyTorch, not Lightning:
+```python
+import sys; sys.path.insert(0, "src")
+from tsfm.export import load_exported, predict_csv
+model, info = load_exported("model_process_A.pt")
+predictions = predict_csv(model, info, "test_process_A.csv")   # one row per batch_id
+```
 `--fast-dev-run` runs one batch per stage as a smoke test. `python src/tsfm/train.py -h` lists all options.
 
 ## Logged to TensorBoard

@@ -4,3 +4,6 @@ test_process_A.csv
 
 # Training runs (TensorBoard logs + checkpoints)
 lightning_logs/
+
+# Exported model weights (recreate with: python src/tsfm/train.py export --checkpoint <finetune best.ckpt>)
+model_process_A.pt

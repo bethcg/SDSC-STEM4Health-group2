@@ -109,7 +109,12 @@ class ClassifierModule(L.LightningModule):
     def __init__(self, channel_names: list[str], pretrained_ckpt: str | None = None,
                  freeze_encoder: bool = False, n_classes: int = 2, lr_head: float = 1e-3,
                  lr_encoder: float = 1e-4, weight_decay: float = 0.05,
-                 class_weights: list[float] | None = None, encoder_kwargs: dict | None = None):
+                 class_weights: list[float] | None = None, encoder_kwargs: dict | None = None,
+                 layer_decay: float | None = None):
+        """layer_decay: if set, layer-wise learning-rate decay. The head trains with lr_head,
+        and every encoder level below it gets `layer_decay` times the LR of the level above:
+            head: lr_head | final norm + last block: lr_head*d | ... | conv stem: lr_head*d^(depth+1)
+        If None, the whole encoder uses lr_encoder."""
         super().__init__()
         self.save_hyperparameters()
         if pretrained_ckpt:
@@ -204,10 +209,27 @@ class ClassifierModule(L.LightningModule):
     def on_test_epoch_end(self):
         self._epoch_metrics("test")
 
+    def layerwise_groups(self, lr_top: float, decay: float) -> list[dict]:
+        """Encoder param groups from top (next to the head) to bottom (conv stem)."""
+        enc = self.encoder
+        blocks = list(enc.blocks)
+        levels = [("block%d+norm" % len(blocks), list(blocks[-1].parameters()) + list(enc.norm.parameters()))]
+        levels += [("block%d" % (i + 1), list(blocks[i].parameters())) for i in range(len(blocks) - 2, -1, -1)]
+        stem = list(enc.embed.parameters()) + (list(enc.channel_emb.parameters()) if enc.channel_emb is not None else [])
+        levels.append(("stem", stem))
+        groups = [{"params": p, "lr": lr_top * decay ** (k + 1), "name": name} for k, (name, p) in enumerate(levels)]
+        n_grouped = sum(x.numel() for g in groups for x in g["params"])
+        assert n_grouped == sum(x.numel() for x in enc.parameters()), "every encoder parameter must be in a group"
+        return groups
+
     def configure_optimizers(self):
-        groups = [{"params": self.head.parameters(), "lr": self.hparams.lr_head}]
-        if not self.hparams.freeze_encoder:
-            groups.append({"params": self.encoder.parameters(), "lr": self.hparams.lr_encoder})
+        groups = [{"params": self.head.parameters(), "lr": self.hparams.lr_head, "name": "head"}]
+        if self.hparams.freeze_encoder:
+            pass
+        elif self.hparams.layer_decay is None:
+            groups.append({"params": self.encoder.parameters(), "lr": self.hparams.lr_encoder, "name": "encoder"})
+        else:
+            groups += self.layerwise_groups(self.hparams.lr_head, self.hparams.layer_decay)
         opt = torch.optim.AdamW(groups, weight_decay=self.hparams.weight_decay)
         sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(1, self.trainer.max_epochs))
         return {"optimizer": opt, "lr_scheduler": sched}

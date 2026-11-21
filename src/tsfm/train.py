@@ -18,6 +18,9 @@ Run from the repository root:
     # plot decoder reconstructions of a pretrained checkpoint
     python src/tsfm/train.py reconstruct --checkpoint lightning_logs/pretrain/version_0/checkpoints/best.ckpt
 
+    # export a finetuned model to one standalone file (default: model_process_A.pt)
+    python src/tsfm/train.py export --checkpoint lightning_logs/finetune/version_0/checkpoints/best.ckpt
+
     # monitor
     tensorboard --logdir lightning_logs
 """
@@ -41,7 +44,7 @@ from tsfm.lit import ClassifierModule, MaskedReconstructionModule
 
 def build_parser():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("stage", choices=["pretrain", "finetune", "evaluate", "reconstruct"])
+    p.add_argument("stage", choices=["pretrain", "finetune", "evaluate", "reconstruct", "export"])
     p.add_argument("--train-csv", default="training_process_A.csv")
     p.add_argument("--test-csv", default="test_process_A.csv")
     p.add_argument("--logdir", default="lightning_logs")
@@ -66,6 +69,16 @@ def build_parser():
     p.add_argument("--freeze-encoder", action="store_true")
     p.add_argument("--lr-encoder", type=float, default=1e-4)
     p.add_argument("--patience", type=int, default=20)
+    p.add_argument("--layer-decay", type=float, default=None,
+                   help="layer-wise LR decay, e.g. 0.5: head gets --lr, each lower encoder level x0.5")
+    # data augmentation (training split only; strengths are relative to per-variable stats)
+    p.add_argument("--augment", action="store_true", help="enable label-preserving augmentation")
+    p.add_argument("--aug-p", type=float, default=0.5, help="probability of each augmentation")
+    p.add_argument("--aug-jitter", type=float, default=0.25, help="noise, x the variable's own noise level")
+    p.add_argument("--aug-shift", type=float, default=0.25, help="level shift, x the accepted batch-to-batch spread")
+    p.add_argument("--aug-scale", type=float, default=0.05, help="sd of the fluctuation amplitude factor")
+    p.add_argument("--aug-stretch", type=float, default=0.1, help="max relative time stretch")
+    p.add_argument("--aug-crop-min", type=float, default=0.9, help="min fraction of the series kept by cropping")
     p.add_argument("--fast-dev-run", action="store_true", help="run 1 batch per stage to smoke-test")
     # evaluate / reconstruct
     p.add_argument("--checkpoint", default=None, help="finetune ckpt (evaluate) or pretrain ckpt (reconstruct)")
@@ -161,6 +174,27 @@ def reconstruct(a):
         print(f"{bid:>8} {label:>9}  {err_name} = {err:.3f}  -> {path}")
 
 
+def export_model(a):
+    """Write a finetuned checkpoint to one standalone file (weights + config + normalisation stats)."""
+    from tsfm.export import export
+
+    if not a.checkpoint:
+        raise SystemExit("--checkpoint (a finetune checkpoint) is required")
+    out = a.out or "model_process_A.pt"
+    model = ClassifierModule.load_from_checkpoint(a.checkpoint, map_location="cpu", pretrained_ckpt=None)
+    # rebuild the training split with the same seed -> identical normalisation statistics
+    dm = BatchSeriesDataModule(a.train_csv, None, patch_size=model.encoder.patch_size, seed=a.seed)
+    dm.setup()
+    if list(dm.channels) != list(model.hparams.channel_names):
+        raise SystemExit("--train-csv has different variables than the checkpoint")
+    meta = {"source_checkpoint": os.path.abspath(a.checkpoint), "train_csv": a.train_csv, "seed": a.seed}
+    metrics_file = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(a.checkpoint))), "test_metrics.json")
+    if os.path.exists(metrics_file):
+        meta["test_metrics"] = json.load(open(metrics_file))
+    export(model, dm.stats, out, meta)
+    print(f"Exported {a.checkpoint} -> {out} ({os.path.getsize(out) / 1e6:.1f} MB)")
+
+
 def parser_default(name):
     return build_parser().get_default(name)
 
@@ -172,9 +206,13 @@ def main(argv=None):
         return evaluate(a)
     if a.stage == "reconstruct":
         return reconstruct(a)
+    if a.stage == "export":
+        return export_model(a)
 
+    augment = (dict(p=a.aug_p, jitter=a.aug_jitter, shift=a.aug_shift, scale=a.aug_scale,
+                    stretch=a.aug_stretch, crop_min=a.aug_crop_min) if a.augment else None)
     dm = BatchSeriesDataModule(a.train_csv, a.test_csv, patch_size=a.patch_size,
-                               batch_size=a.batch_size, max_len=a.max_len, seed=a.seed)
+                               batch_size=a.batch_size, max_len=a.max_len, seed=a.seed, augment=augment)
     dm.setup()
     logger = TensorBoardLogger(a.logdir, name=a.name or a.stage)
     callbacks = [LearningRateMonitor("epoch")]
@@ -192,7 +230,7 @@ def main(argv=None):
                               dropout=a.dropout, use_channel_embedding=not a.no_channel_embedding)
         model = ClassifierModule(dm.channels, pretrained_ckpt=a.pretrained, freeze_encoder=a.freeze_encoder,
                                  lr_head=a.lr, lr_encoder=a.lr_encoder, class_weights=weights,
-                                 encoder_kwargs=encoder_kwargs)
+                                 encoder_kwargs=encoder_kwargs, layer_decay=a.layer_decay)
         if model.encoder.patch_size != a.patch_size:
             raise ValueError(f"--patch-size must match the pretrained encoder ({model.encoder.patch_size})")
         callbacks += [ModelCheckpoint(monitor="val/loss", mode="min", filename="best", save_last=True),
