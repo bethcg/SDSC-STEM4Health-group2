@@ -1,3 +1,6 @@
 # Generated train/test splits (recreate with train_test_split_process_A.ipynb)
 training_process_A.csv
 test_process_A.csv
+
+# Training runs (TensorBoard logs + checkpoints)
+lightning_logs/
