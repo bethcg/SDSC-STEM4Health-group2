@@ -1,0 +1,48 @@
+augment: null
+batch_size: 4
+channel_names:
+- substrate_concentration
+- dissolved_oxygen
+- biomass_concentration
+- penicillin_concentration
+- fermentation_volume
+- dissolved_co2
+- ph
+- reactor_temperature
+- reaction_heat
+- feed_rate
+- aeration_rate
+- agitator_power
+- feed_temperature
+- water_flow_rate
+- hot_cold_switch
+- base_flow
+- acid_flow
+- feed_substate_concentration
+- cooling_water_temperature
+- heating_water_temperature
+class_weights:
+- 0.5714285714285714
+- 4.0
+encoder_kwargs:
+  depth: 3
+  dropout: 0.1
+  heads: 4
+  hidden: 64
+  patch_size: 32
+  use_channel_embedding: true
+freeze_encoder: false
+init_from_export: model_process_A.pt
+layer_decay: null
+lr_encoder: 0.0001
+lr_head: 0.001
+max_len: 5024
+n_classes: 2
+num_workers: 0
+patch_size: 32
+pretrained_ckpt: null
+seed: 42
+test_csv: test_process_B.csv
+train_csv: training_process_B.csv
+val_fraction: 0.0
+weight_decay: 0.05

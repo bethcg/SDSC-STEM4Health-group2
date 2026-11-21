@@ -1,0 +1,36 @@
+batch_size: 8
+channel_names:
+- flow_rate_1
+- density
+- flow_rate_2
+- pressure_1
+- temperature_1
+- temperature_2
+- temperature_3
+- temperature_4
+- pressure_2
+- pressure_3
+- pressure_4
+class_weights:
+- 0.664179104477612
+- 2.022727272727273
+encoder_kwargs:
+  depth: 3
+  dropout: 0.1
+  heads: 4
+  hidden: 64
+  patch_size: 32
+  use_channel_embedding: true
+freeze_encoder: true
+lr_encoder: 0.0001
+lr_head: 0.001
+max_len: 4096
+n_classes: 2
+num_workers: 0
+patch_size: 32
+pretrained_ckpt: lightning_logs/pretrain/version_0/checkpoints/best.ckpt
+seed: 42
+test_csv: test_process_A.csv
+train_csv: training_process_A.csv
+val_fraction: 0.2
+weight_decay: 0.05
