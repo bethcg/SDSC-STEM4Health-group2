@@ -110,11 +110,17 @@ class ClassifierModule(L.LightningModule):
                  freeze_encoder: bool = False, n_classes: int = 2, lr_head: float = 1e-3,
                  lr_encoder: float = 1e-4, weight_decay: float = 0.05,
                  class_weights: list[float] | None = None, encoder_kwargs: dict | None = None,
-                 layer_decay: float | None = None):
+                 layer_decay: float | None = None, init_from_export: str | None = None):
         """layer_decay: if set, layer-wise learning-rate decay. The head trains with lr_head,
         and every encoder level below it gets `layer_decay` times the LR of the level above:
             head: lr_head | final norm + last block: lr_head*d | ... | conv stem: lr_head*d^(depth+1)
-        If None, the whole encoder uses lr_encoder."""
+        If None, the whole encoder uses lr_encoder.
+
+        init_from_export: transfer learning from an exported model file (tsfm.export), e.g.
+        a process A classifier finetuned on process B. All shared weights are reused (conv stem,
+        transformer, head). Variable-identity embeddings are rebuilt for this dataset's variables,
+        because the source model only knows its own variable names. Each one starts at the mean of
+        the source embeddings, i.e. "a generic variable", and is learned during finetuning."""
         super().__init__()
         self.save_hyperparameters()
         if pretrained_ckpt:
@@ -128,6 +134,21 @@ class ClassifierModule(L.LightningModule):
                                                use_channel_embedding=ph.use_channel_embedding)
             if self.vocab is not None and list(self.vocab) != list(channel_names):
                 raise ValueError("finetune data has different variables than the pretrained encoder")
+        elif init_from_export:
+            src = torch.load(init_from_export, map_location="cpu", weights_only=False)
+            kw = dict(src["encoder_kwargs"])
+            use_ce = kw.pop("use_channel_embedding", True)
+            self.encoder = TimeSeriesEncoder(**kw, n_channel_ids=len(channel_names) if use_ce else 0)
+            enc_sd = {k[len("encoder."):]: v for k, v in src["state_dict"].items() if k.startswith("encoder.")}
+            src_emb = enc_sd.pop("channel_emb.weight", None)
+            missing, unexpected = self.encoder.load_state_dict(enc_sd, strict=False)
+            assert not unexpected and set(missing) <= {"channel_emb.weight"}, (missing, unexpected)
+            if use_ce and src_emb is not None:
+                with torch.no_grad():
+                    self.encoder.channel_emb.weight.copy_(src_emb.mean(0, keepdim=True).expand(len(channel_names), -1))
+            self.vocab = channel_names if use_ce else None
+            self.hparams.encoder_kwargs = dict(src["encoder_kwargs"])
+            self._transfer_head = {k[len("head."):]: v for k, v in src["state_dict"].items() if k.startswith("head.")}
         else:   # train from scratch (baseline to measure what pretraining adds)
             kw = dict(encoder_kwargs or {})
             use_ce = kw.pop("use_channel_embedding", True)
@@ -135,10 +156,15 @@ class ClassifierModule(L.LightningModule):
             self.vocab = channel_names if use_ce else None
         if freeze_encoder:
             self.encoder.requires_grad_(False)
+            if init_from_export and self.encoder.channel_emb is not None:
+                self.encoder.channel_emb.requires_grad_(True)
         self.head = ClassificationHead(self.encoder.hidden, n_classes)
+        if getattr(self, "_transfer_head", None):
+            self.head.load_state_dict(self._transfer_head)   # same task (accepted vs rejected)
+            del self._transfer_head
         w = torch.tensor(class_weights, dtype=torch.float32) if class_weights else None
         self.register_buffer("class_weights", w)
-        self._outputs = {"val": [], "test": []}
+        self._outputs = {"train": [], "val": [], "test": []}
 
     def forward(self, batch):
         x = batch["x"]
@@ -203,6 +229,9 @@ class ClassifierModule(L.LightningModule):
             self.logger.experiment.add_figure(f"{stage}/confusion_matrix", fig, self.current_epoch)
             plt.close(fig)
 
+    def on_train_epoch_end(self):
+        self._epoch_metrics("train")   # note: measured with dropout/augmentation active
+
     def on_validation_epoch_end(self):
         self._epoch_metrics("val")
 
@@ -224,12 +253,21 @@ class ClassifierModule(L.LightningModule):
 
     def configure_optimizers(self):
         groups = [{"params": self.head.parameters(), "lr": self.hparams.lr_head, "name": "head"}]
+        # after transfer, the variable embeddings are brand new -> train them at the head's LR
+        new_params = (list(self.encoder.channel_emb.parameters())
+                      if self.hparams.init_from_export and self.encoder.channel_emb is not None else [])
+        if new_params:
+            groups.append({"params": new_params, "lr": self.hparams.lr_head, "name": "new_channel_emb"})
+        new_ids = {id(p) for p in new_params}
         if self.hparams.freeze_encoder:
             pass
         elif self.hparams.layer_decay is None:
-            groups.append({"params": self.encoder.parameters(), "lr": self.hparams.lr_encoder, "name": "encoder"})
+            groups.append({"params": [p for p in self.encoder.parameters() if id(p) not in new_ids],
+                           "lr": self.hparams.lr_encoder, "name": "encoder"})
         else:
-            groups += self.layerwise_groups(self.hparams.lr_head, self.hparams.layer_decay)
+            for g in self.layerwise_groups(self.hparams.lr_head, self.hparams.layer_decay):
+                g["params"] = [p for p in g["params"] if id(p) not in new_ids]
+                groups.append(g)
         opt = torch.optim.AdamW(groups, weight_decay=self.hparams.weight_decay)
         sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(1, self.trainer.max_epochs))
         return {"optimizer": opt, "lr_scheduler": sched}

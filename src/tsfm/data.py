@@ -182,7 +182,10 @@ class BatchSeriesDataModule(L.LightningDataModule):
         ids, series, labels, self.channels = load_batches(h.train_csv)
         idx = np.arange(len(ids))
         strat = labels if min(labels) >= 0 else None
-        tr, va = train_test_split(idx, test_size=h.val_fraction, random_state=h.seed, stratify=strat)
+        if h.val_fraction > 0:
+            tr, va = train_test_split(idx, test_size=h.val_fraction, random_state=h.seed, stratify=strat)
+        else:   # use every training batch for training (tiny datasets); no validation set
+            tr, va = idx, idx[:0]
         pick = lambda lst, ix: [lst[i] for i in ix]
         self.stats = ChannelStats.fit(pick(series, tr))
         self.augmenter = None

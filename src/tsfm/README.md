@@ -41,6 +41,18 @@ python src/tsfm/train.py reconstruct --checkpoint lightning_logs/pretrain/versio
 ```
 Test metrics use "rejected" as the positive class for precision, recall and F1.
 
+### Transfer to another process (e.g. A -> B)
+```bash
+python src/tsfm/train.py finetune --train-csv training_process_B.csv --test-csv test_process_B.csv \
+    --init-from model_process_A.pt --no-validation --epochs 60 --batch-size 4 --max-len 5024 --name finetune_B_from_A
+```
+`--init-from` starts from an exported model.
+* All shared weights are reused: conv stem, transformer and head.
+* Embeddings are rebuilt for the new variables. They start at the mean of the source embeddings and train at the head learning rate.
+* Normalisation statistics are refitted on the new training split.
+
+`--no-validation` trains on every training batch for a fixed number of epochs and tests the final weights. This is meant for very small datasets. `--max-len 5024` avoids randomly cropping the 5001-step B batches.
+
 ### Exporting a model
 ```bash
 python src/tsfm/train.py export --checkpoint lightning_logs/finetune/version_0/checkpoints/best.ckpt   # -> model_process_A.pt

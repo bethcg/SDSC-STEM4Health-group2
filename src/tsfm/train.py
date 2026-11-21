@@ -67,6 +67,14 @@ def build_parser():
     # finetune
     p.add_argument("--pretrained", default=None, help="checkpoint from the pretrain stage")
     p.add_argument("--freeze-encoder", action="store_true")
+    p.add_argument("--init-from", default=None,
+                   help="transfer: start finetuning from an exported model file (e.g. model_process_A.pt)")
+    p.add_argument("--validation", action=argparse.BooleanOptionalAction, default=True,
+                   help="hold out part of the training CSV for validation, early stopping and best-checkpoint "
+                        "selection (default). --no-validation trains on all training batches for a fixed "
+                        "number of epochs and tests the final weights (for very small datasets)")
+    p.add_argument("--val-fraction", type=float, default=0.2,
+                   help="share of training batches held out for validation (only with --validation)")
     p.add_argument("--lr-encoder", type=float, default=1e-4)
     p.add_argument("--patience", type=int, default=20)
     p.add_argument("--layer-decay", type=float, default=None,
@@ -108,7 +116,7 @@ def evaluate(a):
     if not a.checkpoint:
         raise SystemExit("--checkpoint (a finetune checkpoint) is required")
     # pretrained_ckpt=None: the encoder weights come from this checkpoint itself
-    model = ClassifierModule.load_from_checkpoint(a.checkpoint, map_location="cpu", pretrained_ckpt=None)
+    model = ClassifierModule.load_from_checkpoint(a.checkpoint, map_location="cpu", pretrained_ckpt=None, init_from_export=None)
     dm = BatchSeriesDataModule(a.train_csv, a.test_csv, patch_size=model.encoder.patch_size,
                                batch_size=a.batch_size, max_len=a.max_len, seed=a.seed)
     trainer = L.Trainer(logger=TensorBoardLogger(a.logdir, name="evaluate"), accelerator="auto")
@@ -181,7 +189,7 @@ def export_model(a):
     if not a.checkpoint:
         raise SystemExit("--checkpoint (a finetune checkpoint) is required")
     out = a.out or "model_process_A.pt"
-    model = ClassifierModule.load_from_checkpoint(a.checkpoint, map_location="cpu", pretrained_ckpt=None)
+    model = ClassifierModule.load_from_checkpoint(a.checkpoint, map_location="cpu", pretrained_ckpt=None, init_from_export=None)
     # rebuild the training split with the same seed -> identical normalisation statistics
     dm = BatchSeriesDataModule(a.train_csv, None, patch_size=model.encoder.patch_size, seed=a.seed)
     dm.setup()
@@ -212,8 +220,12 @@ def main(argv=None):
     augment = (dict(p=a.aug_p, jitter=a.aug_jitter, shift=a.aug_shift, scale=a.aug_scale,
                     stretch=a.aug_stretch, crop_min=a.aug_crop_min) if a.augment else None)
     dm = BatchSeriesDataModule(a.train_csv, a.test_csv, patch_size=a.patch_size,
-                               batch_size=a.batch_size, max_len=a.max_len, seed=a.seed, augment=augment)
+                               batch_size=a.batch_size, max_len=a.max_len, seed=a.seed, augment=augment,
+                               val_fraction=a.val_fraction if a.validation else 0.0)
     dm.setup()
+    use_val = a.validation
+    if a.stage == "pretrain" and not use_val:
+        raise SystemExit("pretraining needs a validation set (drop --no-validation)")
     logger = TensorBoardLogger(a.logdir, name=a.name or a.stage)
     callbacks = [LearningRateMonitor("epoch")]
 
@@ -228,22 +240,29 @@ def main(argv=None):
         weights = (len(y) / (2 * np.bincount(y, minlength=2))).tolist()   # "balanced" class weights
         encoder_kwargs = dict(hidden=a.hidden, depth=a.depth, heads=a.heads, patch_size=a.patch_size,
                               dropout=a.dropout, use_channel_embedding=not a.no_channel_embedding)
+        if a.pretrained and a.init_from:
+            raise SystemExit("use either --pretrained or --init-from, not both")
         model = ClassifierModule(dm.channels, pretrained_ckpt=a.pretrained, freeze_encoder=a.freeze_encoder,
                                  lr_head=a.lr, lr_encoder=a.lr_encoder, class_weights=weights,
-                                 encoder_kwargs=encoder_kwargs, layer_decay=a.layer_decay)
+                                 encoder_kwargs=encoder_kwargs, layer_decay=a.layer_decay,
+                                 init_from_export=a.init_from)
         if model.encoder.patch_size != a.patch_size:
             raise ValueError(f"--patch-size must match the pretrained encoder ({model.encoder.patch_size})")
-        callbacks += [ModelCheckpoint(monitor="val/loss", mode="min", filename="best", save_last=True),
-                      EarlyStopping(monitor="val/loss", mode="min", patience=a.patience)]
+        if use_val:
+            callbacks += [ModelCheckpoint(monitor="val/loss", mode="min", filename="best", save_last=True),
+                          EarlyStopping(monitor="val/loss", mode="min", patience=a.patience)]
+        else:   # no validation data: train a fixed number of epochs and keep the final weights
+            callbacks.append(ModelCheckpoint(filename="last", save_last=False))
 
     if a.fast_dev_run:   # smoke test: no logger, so don't write checkpoints into the repo root
         callbacks = [c for c in callbacks if not isinstance(c, ModelCheckpoint)]
     trainer = L.Trainer(max_epochs=a.epochs, logger=logger, callbacks=callbacks, accelerator="auto",
-                        log_every_n_steps=5, fast_dev_run=a.fast_dev_run, deterministic=False)
+                        log_every_n_steps=5, fast_dev_run=a.fast_dev_run, deterministic=False,
+                        limit_val_batches=1.0 if use_val else 0)
     trainer.fit(model, datamodule=dm)
 
     if a.stage == "finetune" and a.test_csv:
-        trainer.test(model, datamodule=dm, ckpt_path=None if a.fast_dev_run else "best")
+        trainer.test(model, datamodule=dm, ckpt_path="best" if use_val and not a.fast_dev_run else None)
         if not a.fast_dev_run:
             save_test_results(model, logger.log_dir)
 

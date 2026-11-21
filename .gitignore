@@ -7,3 +7,7 @@ lightning_logs/
 
 # Exported model weights (recreate with: python src/tsfm/train.py export --checkpoint <finetune best.ckpt>)
 model_process_A.pt
+
+# Process B train/test splits (recreate with train_test_split_process_B.ipynb)
+training_process_B.csv
+test_process_B.csv
