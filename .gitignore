@@ -1,0 +1,7 @@
+# never commit challenge data or generated outputs
+data/
+input-data/
+*.tar.gz
+outputs/
+__pycache__/
+.ipynb_checkpoints/
