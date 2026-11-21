@@ -81,6 +81,8 @@ dependencies:
 
   # --- Fast-moving LLM / agent libraries (via pip for latest releases) ---
   - pip:
+      - lightning
+      - tensorboard
       - openai
       - anthropic
       - langchain
