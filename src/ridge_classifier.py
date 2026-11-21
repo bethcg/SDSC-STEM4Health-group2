@@ -2,7 +2,8 @@
 
 One model per process (A and B have different sensors and sizes). Each batch's
 time series is collapsed into summary statistics, then a RidgeClassifier is
-fitted with alpha chosen by inner CV; outer repeated CV gives an honest score.
+fitted with alpha chosen by inner CV on F1 of the "rejected" class (the
+leaderboard metric); outer repeated CV gives an honest estimate of that F1.
 
     python src/ridge_classifier.py                      # CV + predictions
     python src/ridge_classifier.py --data-dir "/home/renku/work/input-data/Project 2 - BRPMM"
@@ -74,15 +75,18 @@ def run_process(p, data_dir, kind, seed):
     n_min = int(y_bin.value_counts().min())
     # outer training folds keep ~(k-1)/k of the rare class, so the inner CV needs fewer splits
     inner = StratifiedKFold(n_splits=min(5, max(2, n_min - 1)), shuffle=True, random_state=seed)
-    search = GridSearchCV(pipe, grid, cv=inner, scoring="balanced_accuracy", n_jobs=-1)
+    # leaderboard metric: F1 of the rejected class (y_bin == 1)
+    search = GridSearchCV(pipe, grid, cv=inner, scoring="f1", n_jobs=-1)
 
     outer = RepeatedStratifiedKFold(n_splits=min(5, n_min), n_repeats=3, random_state=seed)
-    cv = cross_validate(search, X, y_bin, cv=outer, scoring=["balanced_accuracy", "f1_macro", "roc_auc"], n_jobs=1)
-    for m in ["balanced_accuracy", "f1_macro", "roc_auc"]:
+    metrics = ["f1", "precision", "recall", "accuracy"]  # same as the leaderboard, for "rejected"
+    cv = cross_validate(search, X, y_bin, cv=outer, scoring=metrics, n_jobs=1)
+    for m in metrics:
         v = cv[f"test_{m}"]
-        print(f"  nested CV {m:18s}: {v.mean():.3f} +/- {v.std():.3f}")
-    baseline = max(y_bin.mean(), 1 - y_bin.mean())
-    print(f"  majority-class accuracy baseline: {baseline:.3f}")
+        tag = "" if m == "accuracy" else " (rejected)"
+        print(f"  nested CV {m + tag:21s}: {v.mean():.3f} +/- {v.std():.3f}")
+    prev = y_bin.mean()
+    print(f"  baseline 'everything rejected' F1: {2 * prev / (1 + prev):.3f}")
 
     search.fit(X, y_bin)
     print(f"  chosen hyperparameter: {search.best_params_}")
@@ -92,7 +96,7 @@ def run_process(p, data_dir, kind, seed):
     out = pd.DataFrame({"batch_id": Xt.index, "project": p,
                         "label": np.where(pred == 1, "rejected", "accepted")})
     print(f"  test batches: {len(out)}, predicted rejected: {(pred == 1).sum()}")
-    return out
+    return out, cv["test_f1"].mean()
 
 
 def main():
@@ -112,7 +116,11 @@ def main():
     if "input-data" in out.parts or out.is_relative_to(data_dir.resolve()):
         raise SystemExit(f"Refusing to write inside input-data: {out}")
 
-    preds = pd.concat([run_process(p, data_dir, args.model, args.seed) for p in "AB"], ignore_index=True)
+    results = {p: run_process(p, data_dir, args.model, args.seed) for p in "AB"}
+    preds = pd.concat([r[0] for r in results.values()], ignore_index=True)
+    f1 = {p: r[1] for p, r in results.items()}
+    print(f"\nestimated leaderboard score (mean CV F1 of A and B): "
+          f"{(f1['A'] + f1['B']) / 2:.3f}  (A {f1['A']:.3f}, B {f1['B']:.3f})")
 
     template = pd.read_csv(data_dir / "BRPMM_template.csv", dtype={"batch_id": str})
     missing = set(template.batch_id) ^ set(preds.batch_id)
