@@ -99,13 +99,18 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--data-dir", type=Path)
     ap.add_argument("--model", choices=["ridge", "logreg"], default="ridge")
-    ap.add_argument("--out", type=Path, default=Path("outputs/submission.csv"))
+    # anchored to the repo (not the current folder), so running from input-data never writes there
+    repo = Path(__file__).resolve().parent.parent
+    ap.add_argument("--out", type=Path, default=repo / "outputs" / "submission.csv")
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
     # B has ~5 rejected batches: some CV folds hold a single class, which makes sklearn chatty
     warnings.filterwarnings("ignore", category=UserWarning, module="sklearn")
     data_dir = args.data_dir or find_data_dir()
     print(f"data: {data_dir}  model: {args.model}")
+    out = args.out.resolve()
+    if "input-data" in out.parts or out.is_relative_to(data_dir.resolve()):
+        raise SystemExit(f"Refusing to write inside input-data: {out}")
 
     preds = pd.concat([run_process(p, data_dir, args.model, args.seed) for p in "AB"], ignore_index=True)
 
