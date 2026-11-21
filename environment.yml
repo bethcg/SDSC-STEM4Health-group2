@@ -92,3 +92,4 @@ dependencies:
       - chromadb
       - tiktoken
       - unstructured
+      - aeon                # MiniRocket (src/compare_models.py, notebooks/02_minirocket_seed0.ipynb)

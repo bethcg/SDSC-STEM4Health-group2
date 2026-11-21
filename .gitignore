@@ -5,3 +5,6 @@ input-data/
 outputs/
 __pycache__/
 .ipynb_checkpoints/
+# data written by train_test_split_process_A.ipynb
+training_process_A.csv
+test_process_A.csv
