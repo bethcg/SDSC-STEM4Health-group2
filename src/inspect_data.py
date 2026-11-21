@@ -51,7 +51,14 @@ def summarise_notebook(path):
 
 
 def main():
-    root = Path(sys.argv[1]) if len(sys.argv) > 1 else DEFAULT
+    if len(sys.argv) > 1:
+        root = Path(sys.argv[1])
+    else:
+        here = Path(__file__).resolve().parent
+        candidates = [DEFAULT, here.parent / DEFAULT, here.parent.parent / DEFAULT, Path.home() / "work" / DEFAULT]
+        root = next((c for c in candidates if c.is_dir()), None)
+        if root is None:
+            sys.exit("Could not find 'input-data/Project 2 - BRPMM'. Pass the path as an argument.")
     print(f"ROOT: {root.resolve()}\n")
 
     print("== TREE ==")
